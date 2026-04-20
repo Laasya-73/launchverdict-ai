@@ -1,0 +1,27 @@
+node_modules/
+.svelte-kit/
+build/
+dist/
+coverage/
+.vitest/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local debug artifacts
+debug_pdf/
