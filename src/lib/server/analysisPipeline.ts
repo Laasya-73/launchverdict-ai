@@ -62,6 +62,54 @@ function confidenceBand(confidence: number): 'High confidence' | 'Moderate confi
   return 'Close decision';
 }
 
+const dimensionLabel: Record<keyof VentureReport['scores']['dimensionScores'], string> = {
+  problemClarity: 'problem clarity',
+  customerPain: 'customer pain',
+  differentiation: 'differentiation',
+  feasibility: 'feasibility',
+  monetization: 'monetization',
+  goToMarket: 'go-to-market',
+  defensibility: 'defensibility',
+  scalability: 'scalability'
+};
+
+function stripEvidenceTag(text: string): string {
+  return text.replace(/^\[(model-estimate|inferred|rule-based)\]\s*/i, '').trim();
+}
+
+function normalizeClaimText(text: string): string {
+  return stripEvidenceTag(text).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+function strongestWeakestDimensions(report: VentureReport): {
+  best: { key: keyof VentureReport['scores']['dimensionScores']; label: string; value: number };
+  worst: { key: keyof VentureReport['scores']['dimensionScores']; label: string; value: number };
+} {
+  const entries = Object.entries(report.scores.dimensionScores) as Array<
+    [keyof VentureReport['scores']['dimensionScores'], number]
+  >;
+  const sorted = [...entries].sort((a, b) => b[1] - a[1]);
+  const [bestKey, bestValue] = sorted[0];
+  const [worstKey, worstValue] = sorted[sorted.length - 1];
+
+  return {
+    best: { key: bestKey, label: dimensionLabel[bestKey], value: bestValue },
+    worst: { key: worstKey, label: dimensionLabel[worstKey], value: worstValue }
+  };
+}
+
+function topRiskSignal(report: VentureReport, exclude?: string): string {
+  const candidates = [...report.failureRisks, ...report.topWeaknesses]
+    .map((line) => stripEvidenceTag(line))
+    .filter(Boolean);
+  if (!candidates.length) return 'No critical blocker identified yet.';
+  if (!exclude) return candidates[0];
+
+  const excluded = normalizeClaimText(exclude);
+  const distinct = candidates.find((line) => normalizeClaimText(line) !== excluded);
+  return distinct ?? candidates[0];
+}
+
 function buildComparisonNarrative(
   matrix: ComparisonMetric[],
   winner: 'Idea A' | 'Idea B',
@@ -71,26 +119,82 @@ function buildComparisonNarrative(
   a: VentureReport,
   b: VentureReport
 ): { winnerReason: string; tradeoffs: string[]; recommendation: string } {
+  const mode = a.critiqueMode;
+  const winnerSide: 'A' | 'B' = winner === 'Idea A' ? 'A' : 'B';
+  const loser = winner === 'Idea A' ? 'Idea B' : 'Idea A';
+  const loserSide: 'A' | 'B' = winnerSide === 'A' ? 'B' : 'A';
   const winsA = matrix.filter((row) => row.winner === 'A').length;
   const winsB = matrix.filter((row) => row.winner === 'B').length;
   const topGap = [...matrix]
     .map((row) => ({ ...row, gap: Math.abs(row.ideaA - row.ideaB) }))
     .sort((x, y) => y.gap - x.gap)[0];
+  const deltas = matrix
+    .map((row) => {
+      const winnerScore = winnerSide === 'A' ? row.ideaA : row.ideaB;
+      const loserScore = winnerSide === 'A' ? row.ideaB : row.ideaA;
+      return {
+        metric: row.metric,
+        winnerScore,
+        loserScore,
+        delta: winnerScore - loserScore
+      };
+    })
+    .sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
+  const winnerLeads = deltas.filter((d) => d.delta > 0.05).sort((x, y) => y.delta - x.delta);
+  const winnerLagging = deltas.filter((d) => d.delta < -0.05).sort((x, y) => x.delta - y.delta);
+  const decisiveLead = winnerLeads[0] ?? deltas[0];
+  const supportLead = winnerLeads[1];
+  const loserEdge = winnerLagging[0];
+  const aShape = strongestWeakestDimensions(a);
+  const bShape = strongestWeakestDimensions(b);
+  const aRisk = topRiskSignal(a);
+  const bRisk = topRiskSignal(b, aRisk);
+  const sameRisk = normalizeClaimText(aRisk) === normalizeClaimText(bRisk);
+  const aRiskLine = sameRisk ? `Shared top risk: ${aRisk}` : `Idea A risk: ${aRisk}`;
+  const bRiskLine = sameRisk ? `Shared top risk: ${bRisk}` : `Idea B risk: ${bRisk}`;
 
-  const winnerReason = `${winner} wins on aggregate signal (${winner === 'Idea A' ? winsA : winsB} of ${
-    matrix.length
-  } comparison dimensions), with the strongest edge in ${topGap.metric}. Confidence: ${confidence.toFixed(2)} (${band}).${
-    closeCall ? ' This is a close call, so validate with real customer interviews before committing.' : ''
-  }`;
+  const winnerReason =
+    mode === 'brutal'
+      ? `${winner} wins ${winner === 'Idea A' ? winsA : winsB}/${matrix.length} dimensions because ${decisiveLead.metric} is materially better (${decisiveLead.winnerScore.toFixed(
+          1
+        )} vs ${decisiveLead.loserScore.toFixed(1)}).${
+          supportLead ? ` Secondary edge: ${supportLead.metric} (${supportLead.winnerScore.toFixed(1)} vs ${supportLead.loserScore.toFixed(1)}).` : ''
+        } Confidence: ${confidence.toFixed(2)} (${band}).${closeCall ? ' Close call: do not commit until a customer pays.' : ''}`
+      : `${winner} wins on aggregate signal (${winner === 'Idea A' ? winsA : winsB} of ${
+          matrix.length
+        } comparison dimensions) mainly due to ${decisiveLead.metric} (${decisiveLead.winnerScore.toFixed(1)} vs ${decisiveLead.loserScore.toFixed(
+          1
+        )}).${supportLead ? ` It also leads on ${supportLead.metric} (${supportLead.winnerScore.toFixed(1)} vs ${supportLead.loserScore.toFixed(1)}).` : ''} Confidence: ${confidence.toFixed(2)} (${band}).${
+          closeCall ? ' This is a close call, so validate with real customer interviews before committing.' : ''
+        }`;
 
-  const tradeoffs = [
-    `Idea A edge: ${a.finalVerdict} (${a.scores.overallVentureScore}/10)`,
-    `Idea B edge: ${b.finalVerdict} (${b.scores.overallVentureScore}/10)`,
-    topGap.gap >= 1 ? `Largest tradeoff is ${topGap.metric} (${topGap.ideaA.toFixed(1)} vs ${topGap.ideaB.toFixed(1)}).` : 'Largest tradeoff is moderate; neither idea has a runaway advantage.',
-    'Use customer interview evidence to validate the highest-uncertainty assumption before committing.'
-  ];
+  const tradeoffs =
+    mode === 'brutal'
+      ? [
+          `Winner edge: ${winner} beats ${loser} on ${decisiveLead.metric} by ${(decisiveLead.delta >= 0 ? decisiveLead.delta : -decisiveLead.delta).toFixed(1)} points (${decisiveLead.winnerScore.toFixed(1)} vs ${decisiveLead.loserScore.toFixed(1)}).`,
+          loserEdge
+            ? `${loser} only clearly wins ${loserEdge.metric} (${(loserEdge.delta * -1).toFixed(1)} points back), but it does not offset the winner's lead.`
+            : `${loser} does not have a meaningful metric advantage in this comparison set.`,
+          topGap.gap >= 1
+            ? `Biggest separation is ${topGap.metric} (${topGap.ideaA.toFixed(1)} vs ${topGap.ideaB.toFixed(1)}).`
+            : 'No runaway advantage; both options still need sharper execution.',
+          sameRisk ? `Failure trigger check: both ideas share the same blocker -> ${aRisk}` : `Failure trigger check: ${aRiskLine} | ${bRiskLine}`
+        ]
+      : [
+          `Why ${winner} has the edge: ${decisiveLead.metric} is higher by ${(decisiveLead.delta >= 0 ? decisiveLead.delta : -decisiveLead.delta).toFixed(1)} points (${decisiveLead.winnerScore.toFixed(1)} vs ${decisiveLead.loserScore.toFixed(1)}).`,
+          loserEdge
+            ? `${loser} still has one advantage in ${loserEdge.metric} (${(loserEdge.delta * -1).toFixed(1)} points), but it is not enough to win overall.`
+            : `${loser} does not show a clear counter-advantage in the scored dimensions.`,
+          topGap.gap >= 1
+            ? `Largest tradeoff is ${topGap.metric} (${topGap.ideaA.toFixed(1)} vs ${topGap.ideaB.toFixed(1)}).`
+            : 'Largest tradeoff is moderate; neither idea has a runaway advantage.',
+          sameRisk ? `Risk to validate next: both ideas share the same blocker -> ${aRisk}` : `Risk to validate next: ${aRiskLine} | ${bRiskLine}`
+        ];
 
-  const recommendation = `Prioritize ${winner}. Keep the runner-up as a pivot option if early sales signal underperforms.`;
+  const recommendation =
+    mode === 'brutal'
+      ? `Pick ${winner}, but prove paid demand quickly. If pilots stall, cut scope or pivot immediately.`
+      : `Prioritize ${winner}. Keep the runner-up as a pivot option if early sales signal underperforms.`;
 
   return { winnerReason, tradeoffs, recommendation };
 }
